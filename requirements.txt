@@ -1,0 +1,4 @@
+openai>=1.40
+pillow>=10.0
+tqdm>=4.66
+huggingface_hub[hf_xet]>=0.30
