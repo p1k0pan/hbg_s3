@@ -1,6 +1,6 @@
 # 8月13日
 
-运行代码 **注意两个数据文件要分开两个跑的**
+使用**"gpt5.6"**运行代码: **注意两个数据文件要分开两个跑的**
 ```
 python run_blind_annotator.py \
   --tasks de_third_model_tasks.jsonl \
@@ -19,7 +19,7 @@ python run_blind_annotator.py \
 
 ```
 python run_blind_annotator.py \
-  --tasks de_third_model_tasks.jsonl \
+  --tasks au_third_model_tasks.jsonl \
   --image-root  '下载图片的位置' \
   --out-dir stage3_runs/au/model_c_gpt5.6 \
   --annotator-id model_c_gpt5.6 \
