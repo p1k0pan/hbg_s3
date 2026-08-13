@@ -36,6 +36,7 @@ from runtime import (
     find_crop,
     load_image,
     make_overview,
+    is_gpt5_model,
     normalized_text,
     pending_crop_ids,
     read_api_config,
@@ -436,6 +437,52 @@ def derive_vote(
     }
 
 
+def load_resume_crops(
+    resume_root: Path,
+    batch: dict[str, Any],
+) -> tuple[list[dict[str, Any]], Path]:
+    report_path = resume_root / "batches" / batch["batch_id"] / "report.json"
+    if not report_path.is_file():
+        raise FileNotFoundError(f"resume report not found: {report_path}")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if report.get("batch_id") != batch["batch_id"]:
+        raise ValueError(f"resume report batch mismatch: {report_path}")
+    if str(report.get("sample_id")) != str(batch["sample_id"]):
+        raise ValueError(f"resume report sample mismatch: {report_path}")
+
+    crops: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in report.get("crops") or []:
+        if not isinstance(raw, dict):
+            continue
+        crop_id = str(raw.get("crop_id") or "")
+        args = raw.get("args")
+        if not crop_id or crop_id in seen or not isinstance(args, dict):
+            continue
+        observation = raw.get("observation")
+        crops.append(
+            {
+                "crop_id": crop_id,
+                "args": dict(args),
+                "reason": str(raw.get("reason") or args.get("reason") or ""),
+                "saved_path": raw.get("saved_path"),
+                "observation": dict(observation) if isinstance(observation, dict) else None,
+                "recovered_from": str(report_path),
+            }
+        )
+        seen.add(crop_id)
+    return crops, report_path
+
+
+def crop_sequence(crops: list[dict[str, Any]]) -> int:
+    values = []
+    for crop in crops:
+        match = re.fullmatch(r"crop_(\d+)", str(crop.get("crop_id") or ""))
+        if match:
+            values.append(int(match.group(1)))
+    return max(values, default=0)
+
+
 class BlindVisualRunner:
     def __init__(
         self,
@@ -443,13 +490,19 @@ class BlindVisualRunner:
         annotator_id: str,
         image_root: Path,
         enable_thinking: bool,
-        thinking_budget: int,
+        thinking_budget: int | None,
+        reasoning_effort: str | None,
+        completion_token_limit: int | None,
+        resume_from_out_dir: Path | None,
     ):
         self.cfg = cfg
         self.annotator_id = annotator_id
         self.image_root = image_root
         self.enable_thinking = enable_thinking
         self.thinking_budget = thinking_budget
+        self.reasoning_effort = reasoning_effort
+        self.completion_token_limit = completion_token_limit
+        self.resume_from_out_dir = resume_from_out_dir
         hosts = list(dict.fromkeys([*cfg.hosts, cfg.host]))
         self.pool = ClientPool(
             hosts,
@@ -492,28 +545,74 @@ class BlindVisualRunner:
         trace: list[dict[str, Any]] = []
         submitted: dict[str, dict[str, Any]] | None = None
         n_inspections = 0
+        resume_report_path: Path | None = None
+        if self.resume_from_out_dir is not None:
+            crops, resume_report_path = load_resume_crops(
+                self.resume_from_out_dir,
+                batch,
+            )
+            n_inspections = crop_sequence(crops)
+            active_crop_ids = [crop["crop_id"] for crop in crops[-cfg.max_active_crops :]]
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Resume this unfinished annotation. Recovered {len(crops)} prior crops and "
+                        f"{sum(crop.get('observation') is not None for crop in crops)} recorded observations. "
+                        "Use the recovered evidence memory below, continue inspecting only where needed, "
+                        "and finish by submitting the vote."
+                    ),
+                }
+            )
+            for crop in crops[-cfg.max_active_crops :]:
+                try:
+                    _, data_url = execute_inspect_region(loaded, crop["args"], cfg)
+                except Exception:
+                    continue
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Recovered {crop['crop_id']}: {crop['reason']}",
+                            },
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
+                        f"{INTERNAL_PREFIX}kind": "crop_image",
+                        f"{INTERNAL_PREFIX}crop_id": crop["crop_id"],
+                    }
+                )
         started = time.time()
 
-        for step_index in range(cfg.max_steps):
+        total_steps = max(1, cfg.max_steps - 1) + cfg.max_submit_attempts
+        for step_index in range(total_steps):
             refresh_context(messages, crops, active_crop_ids, cfg.max_active_crops)
-            force_submit = step_index == cfg.max_steps - 1
+            force_submit = step_index >= max(0, cfg.max_steps - 1)
+            final_attempt = step_index == total_steps - 1
             tool_choice: Any = (
                 {"type": "function", "function": {"name": "submit_visual_votes"}}
                 if force_submit else "auto"
             )
+            available_tools = [submit_votes_tool()] if force_submit else self.tools
             kwargs: dict[str, Any] = {
                 "messages": api_messages(messages),
-                "tools": self.tools,
+                "tools": available_tools,
                 "tool_choice": tool_choice,
-                "temperature": cfg.temperature,
-                "max_tokens": cfg.max_tokens,
                 "timeout": cfg.request_timeout,
             }
-            if self.enable_thinking:
-                kwargs["extra_body"] = {
-                    "enable_thinking": True,
-                    "thinking_budget": self.thinking_budget,
-                }
+            if is_gpt5_model(self.model):
+                if self.completion_token_limit is not None:
+                    kwargs["max_completion_tokens"] = self.completion_token_limit
+                if self.reasoning_effort:
+                    kwargs["reasoning_effort"] = self.reasoning_effort
+            else:
+                kwargs["temperature"] = cfg.temperature
+                kwargs["max_tokens"] = cfg.max_tokens
+            if self.enable_thinking and not is_gpt5_model(self.model):
+                kwargs["extra_body"] = {"enable_thinking": True}
+                if self.thinking_budget is not None:
+                    kwargs["extra_body"]["thinking_budget"] = self.thinking_budget
             try:
                 response = self.pool.chat(**kwargs)
             except Exception as exc:
@@ -543,7 +642,11 @@ class BlindVisualRunner:
                 messages.append(
                     {
                         "role": "user",
-                        "content": "Use inspect_region if needed, then finish with submit_visual_votes.",
+                        "content": (
+                            "You must now call submit_visual_votes. Do not inspect or record more evidence."
+                            if force_submit
+                            else "Use inspect_region if needed, then finish with submit_visual_votes."
+                        ),
                     }
                 )
                 continue
@@ -556,6 +659,14 @@ class BlindVisualRunner:
                 except json.JSONDecodeError:
                     args = {}
                 step_trace["tool_calls"].append({"name": name, "args": args})
+
+                if force_submit and name != "submit_visual_votes":
+                    text = "Final submission phase: call submit_visual_votes now; no other tools are available."
+                    messages.append({"role": "tool", "tool_call_id": call.id, "content": text})
+                    step_trace["tool_results"].append(
+                        {"name": name, "status": "rejected_final_phase", "error": text}
+                    )
+                    continue
 
                 if name == "inspect_region":
                     try:
@@ -614,7 +725,7 @@ class BlindVisualRunner:
                     errors = submission_errors(batch, answers, crops)
                     if pending:
                         errors.insert(0, f"record observations for pending crops: {', '.join(pending)}")
-                    if errors and not force_submit:
+                    if errors and not final_attempt:
                         text = "Submission rejected:\n- " + "\n- ".join(errors)
                         messages.append({"role": "tool", "tool_call_id": call.id, "content": text})
                         step_trace["tool_results"].append(
@@ -667,6 +778,12 @@ class BlindVisualRunner:
             "n_questions": len(batch["questions"]),
             "n_answers": len(submitted),
             "n_inspections": n_inspections,
+            "resumed_from_report": str(resume_report_path) if resume_report_path else None,
+            "n_recovered_crops": sum("recovered_from" in crop for crop in crops),
+            "n_recovered_observations": sum(
+                "recovered_from" in crop and crop.get("observation") is not None
+                for crop in crops
+            ),
             "elapsed_s": round(time.time() - started, 1),
             "votes": votes,
             "crops": crops,
@@ -716,13 +833,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-done", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-steps", type=int, default=10)
+    parser.add_argument(
+        "--max-submit-attempts",
+        type=int,
+        default=3,
+        help="submit-only attempts after the inspection phase",
+    )
     parser.add_argument("--max-active-crops", type=int, default=6)
     parser.add_argument("--max-parallel-tools", type=int, default=3)
-    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help=(
+            "optional completion-token limit; GPT-5 uses the service default when "
+            "omitted, while local OpenAI-compatible models retain the 4096 default"
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=["none", "low", "medium", "high", "xhigh", "max"],
+        default=None,
+        help="GPT-5 reasoning effort; omit to use the model default",
+    )
     parser.add_argument("--enable-thinking", action="store_true")
-    parser.add_argument("--thinking-budget", type=int, default=2048)
+    parser.add_argument(
+        "--thinking-budget",
+        type=int,
+        default=None,
+        help="optional thinking-token limit; omit to use the service default",
+    )
     parser.add_argument("--save-crops", action="store_true")
+    parser.add_argument(
+        "--resume-from-out-dir",
+        type=Path,
+        help="reuse crop observations from matching batch reports in an earlier output directory",
+    )
     return parser.parse_args()
 
 
@@ -732,6 +879,8 @@ def main() -> None:
         raise SystemExit("--annotator-id may contain only letters, numbers, dot, underscore, and hyphen")
     if args.max_questions_per_batch < 1:
         raise SystemExit("--max-questions-per-batch must be >= 1")
+    if args.max_submit_attempts < 1:
+        raise SystemExit("--max-submit-attempts must be >= 1")
     if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
         raise SystemExit("require --shard-count >= 1 and 0 <= --shard-index < --shard-count")
 
@@ -809,11 +958,18 @@ def main() -> None:
     cfg.api_key = args.api_key or file_key or cfg.api_key
     cfg.out_dir = str(args.out_dir)
     cfg.max_steps = args.max_steps
+    cfg.max_submit_attempts = args.max_submit_attempts
     cfg.max_active_crops = args.max_active_crops
     cfg.max_parallel_tools = args.max_parallel_tools
-    cfg.max_tokens = args.max_tokens
+    cfg.max_tokens = args.max_tokens if args.max_tokens is not None else 4096
     cfg.temperature = args.temperature
     cfg.save_crops = args.save_crops
+
+    if args.enable_thinking and args.model.casefold().startswith("gpt-5"):
+        raise SystemExit(
+            "--enable-thinking/--thinking-budget are vLLM extensions; "
+            "use --reasoning-effort with GPT-5 models"
+        )
 
     manifest = {
         "schema_version": "stage3_annotator_run_manifest_v1",
@@ -833,12 +989,15 @@ def main() -> None:
         "shard_count": args.shard_count,
         "shard_index": args.shard_index,
         "max_steps": args.max_steps,
+        "max_submit_attempts": args.max_submit_attempts,
         "max_active_crops": args.max_active_crops,
         "max_parallel_tools": args.max_parallel_tools,
-        "max_tokens": args.max_tokens,
+        "completion_token_limit": args.max_tokens,
         "temperature": args.temperature,
         "enable_thinking": args.enable_thinking,
         "thinking_budget": args.thinking_budget if args.enable_thinking else None,
+        "reasoning_effort": args.reasoning_effort,
+        "resume_from_out_dir": str(args.resume_from_out_dir) if args.resume_from_out_dir else None,
     }
     (args.out_dir / "run_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -850,6 +1009,9 @@ def main() -> None:
         args.image_root,
         args.enable_thinking,
         args.thinking_budget,
+        args.reasoning_effort,
+        args.max_tokens,
+        args.resume_from_out_dir,
     )
     manifest["resolved_model"] = runner.model
     (args.out_dir / "run_manifest.json").write_text(
